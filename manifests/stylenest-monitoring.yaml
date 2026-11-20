@@ -1,0 +1,431 @@
+# ── Prometheus RBAC ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "endpoints", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+# ── Prometheus ConfigMap (scrape config + 9 alert rules) ──────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: 'k8s-stylenest'
+        environment: 'production'
+
+    rule_files:
+      - /etc/prometheus/rules.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['alertmanager:9093']
+
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: 'kubernetes-nodes'
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+
+      - job_name: 'mongodb-exporter'
+        static_configs:
+          - targets: ['mongodb-exporter.stylenest:9216']
+            labels:
+              namespace: 'stylenest'
+              app: 'mongodb'
+
+      - job_name: 'node-exporter'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: node-exporter
+
+  rules.yml: |
+    groups:
+      - name: stylenest.rules
+        rules:
+          - alert: BackendDown
+            expr: up{app="backend"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "StyleNest Backend is down"
+              description: "Backend pod {{ $labels.pod }} down for more than 1 minute."
+          - alert: FrontendDown
+            expr: up{app="frontend"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "StyleNest Frontend is down"
+              description: "Frontend pod {{ $labels.pod }} down for more than 1 minute."
+          - alert: MongoDBDown
+            expr: up{app="mongodb"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "MongoDB is down"
+              description: "MongoDB has been down for more than 1 minute."
+          - alert: HighCPUUsage
+            expr: rate(container_cpu_usage_seconds_total{namespace="stylenest"}[5m]) > 0.8
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU in stylenest namespace"
+              description: "Pod {{ $labels.pod }} CPU above 80%."
+          - alert: HighMemoryUsage
+            expr: container_memory_usage_bytes{namespace="stylenest"} / container_spec_memory_limit_bytes{namespace="stylenest"} > 0.85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory in stylenest namespace"
+              description: "Pod {{ $labels.pod }} memory above 85%."
+          - alert: PodCrashLooping
+            expr: rate(kube_pod_container_status_restarts_total{namespace="stylenest"}[15m]) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} is crash looping"
+          - alert: NodeMemoryHigh
+            expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node memory above 85%"
+              description: "Node {{ $labels.instance }} memory critically high."
+          - alert: NodeDiskHigh
+            expr: (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) > 0.80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node disk above 80%"
+              description: "Node {{ $labels.instance }} disk running low."
+          - alert: HPAScalingTriggered
+            expr: kube_horizontalpodautoscaler_status_current_replicas{namespace="stylenest"} > kube_horizontalpodautoscaler_spec_min_replicas{namespace="stylenest"}
+            for: 1m
+            labels:
+              severity: info
+            annotations:
+              summary: "HPA scaling triggered"
+              description: "{{ $labels.horizontalpodautoscaler }} scaled up in stylenest."
+---
+# ── Prometheus PVC / Deployment / Service ─────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=7d"
+            - "--web.enable-lifecycle"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "400m"
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  type: NodePort
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
+---
+# ── Alertmanager ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: 'default'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'critical'
+          repeat_interval: 1h
+        - match:
+            severity: warning
+          receiver: 'warning'
+          repeat_interval: 6h
+    receivers:
+      - name: 'default'
+        webhook_configs:
+          - url: 'http://REPLACE_WITH_WEBHOOK:5001/'
+            send_resolved: true
+      - name: 'critical'
+        webhook_configs:
+          - url: 'http://REPLACE_WITH_WEBHOOK:5001/'
+            send_resolved: true
+      - name: 'warning'
+        webhook_configs:
+          - url: 'http://REPLACE_WITH_WEBHOOK:5001/'
+            send_resolved: true
+    inhibit_rules:
+      - source_match:
+          severity: 'critical'
+        target_match:
+          severity: 'warning'
+        equal: ['alertname', 'namespace']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - "--config.file=/etc/alertmanager/alertmanager.yml"
+            - "--storage.path=/alertmanager"
+          ports:
+            - containerPort: 9093
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  selector:
+    app: alertmanager
+  type: NodePort
+  ports:
+    - port: 9093
+      targetPort: 9093
+      nodePort: 30093
+---
+# ── Node Exporter DaemonSet + Service ─────────────────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.7.0
+          args:
+            - "--path.procfs=/host/proc"
+            - "--path.sysfs=/host/sys"
+            - "--path.rootfs=/host/root"
+            - "--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($|/)"
+          ports:
+            - containerPort: 9100
+              hostPort: 9100
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              readOnly: true
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    app: node-exporter
+  ports:
+    - port: 9100
+      targetPort: 9100

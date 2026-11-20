@@ -1,0 +1,147 @@
+---
+- name: Disable swap (required by kubelet)
+  ansible.builtin.command: swapoff -a
+  changed_when: false
+
+- name: Remove swap entry from /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+    replace: '# \1'
+
+- name: Persist kernel modules across reboot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    mode: "0644"
+
+- name: Load required kernel modules now
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop:
+    - overlay
+    - br_netfilter
+  changed_when: true
+
+- name: Set required sysctl params for Kubernetes networking
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    mode: "0644"
+  notify: Reload sysctl
+
+- name: Flush handlers so sysctl settings apply before later steps
+  ansible.builtin.meta: flush_handlers
+
+- name: Install prerequisite packages
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+      - software-properties-common
+    state: present
+    update_cache: true
+
+- name: Install containerd
+  ansible.builtin.apt:
+    name: containerd
+    state: present
+
+- name: Create containerd config directory
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: "0755"
+
+- name: Generate default containerd config
+  ansible.builtin.command: containerd config default
+  register: containerd_default_config
+  changed_when: false
+
+- name: Write containerd config with SystemdCgroup and correct pause image
+  ansible.builtin.copy:
+    dest: /etc/containerd/config.toml
+    mode: "0644"
+    content: >-
+      {{ containerd_default_config.stdout
+           | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true')
+           | regex_replace('sandbox_image = .*', 'sandbox_image = "' ~ containerd_sandbox_image ~ '"') }}
+  notify: Restart containerd
+
+- name: Ensure containerd is enabled and running
+  ansible.builtin.systemd:
+    name: containerd
+    enabled: true
+    state: started
+
+- name: Flush handlers so containerd config is applied before kubelet starts
+  ansible.builtin.meta: flush_handlers
+
+- name: Add Kubernetes apt signing key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_apt_series }}/deb/Release.key"
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: "0644"
+    force: true
+
+- name: Add Kubernetes apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_apt_series }}/deb/ /"
+    filename: kubernetes
+    state: present
+
+- name: Remove any shadow kubeadm/kubectl/kubelet binaries from /usr/local/bin
+  ansible.builtin.file:
+    path: "/usr/local/bin/{{ item }}"
+    state: absent
+  loop:
+    - kubeadm
+    - kubectl
+    - kubelet
+
+- name: Install pinned kubelet, kubeadm, kubectl
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ kubernetes_version_apt }}"
+      - "kubeadm={{ kubernetes_version_apt }}"
+      - "kubectl={{ kubernetes_version_apt }}"
+    state: present
+    update_cache: true
+
+- name: Hold kubelet, kubeadm, kubectl at pinned version
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+- name: Enable kubelet service (will stay pending until kubeadm init/join)
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+
+- name: Verify no shadow binaries remain on PATH ahead of the apt packages
+  ansible.builtin.command: which -a kubeadm
+  register: which_kubeadm
+  changed_when: false
+
+- name: Fail if kubeadm resolves anywhere other than /usr/bin/kubeadm first
+  ansible.builtin.fail:
+    msg: >-
+      kubeadm on PATH resolves to {{ which_kubeadm.stdout_lines[0] }} instead
+      of /usr/bin/kubeadm. Check for a shadow binary earlier on $PATH.
+  when: which_kubeadm.stdout_lines[0] != '/usr/bin/kubeadm'
+
+- name: Verify installed kubeadm version matches pinned version
+  ansible.builtin.command: kubeadm version -o short
+  register: kubeadm_installed_version
+  changed_when: false
+  failed_when: kubernetes_version not in kubeadm_installed_version.stdout

@@ -1,0 +1,74 @@
+---
+- name: Check whether this node is already an initialized control-plane
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+
+- name: Run kubeadm init
+  ansible.builtin.command: >-
+    kubeadm init
+    --apiserver-advertise-address={{ control_plane_endpoint }}
+    --pod-network-cidr={{ pod_network_cidr }}
+    --kubernetes-version=v{{ kubernetes_version }}
+  register: kubeadm_init_result
+  when: not admin_conf.stat.exists
+
+- name: Show kubeadm init output
+  ansible.builtin.debug:
+    msg: "{{ kubeadm_init_result.stdout_lines }}"
+  when: not admin_conf.stat.exists
+
+- name: Create ~/.kube directory for the ansible_user
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+
+- name: Copy admin.conf to user's kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Wait for the API server to be reachable
+  ansible.builtin.uri:
+    url: "https://{{ control_plane_endpoint }}:{{ apiserver_bind_port }}/healthz"
+    validate_certs: false
+    status_code: 200
+  register: api_health
+  until: api_health.status == 200
+  retries: 30
+  delay: 5
+
+- name: Apply Weave CNI manifest
+  ansible.builtin.command: >-
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf
+    apply -f {{ weave_manifest_url }}
+  register: weave_apply
+  changed_when: "'unchanged' not in weave_apply.stdout"
+  when: cni_plugin == 'weave'
+
+- name: Wait for Weave IPAM to reach quorum on this node
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:6784/status"
+    return_content: true
+  register: weave_status
+  until: "'awaiting consensus' not in weave_status.content"
+  retries: 30
+  delay: 10
+  when: cni_plugin == 'weave'
+
+- name: Generate a fresh join command
+  ansible.builtin.command: kubeadm token create --print-join-command
+  register: kubeadm_join_command_result
+  changed_when: false
+
+- name: Share join command with all hosts in the play
+  ansible.builtin.add_host:
+    name: "join_command_holder"
+    kubeadm_join_command: "{{ kubeadm_join_command_result.stdout }}"

@@ -1,0 +1,15 @@
+---
+# Kubernetes bootstrap variables
+kubernetes_version: "1.30.0"
+kubernetes_version_apt: "1.30.0-1.1"
+kubernetes_apt_series: "v1.30"
+kubernetes_version_major_minor: "1.30"
+
+control_plane_endpoint: 10.10.10.199
+apiserver_bind_port: 6443
+pod_network_cidr: "10.244.0.0/16"
+
+cni_plugin: weave
+weave_manifest_url: "https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml"
+
+containerd_sandbox_image: "registry.k8s.io/pause:3.9"
